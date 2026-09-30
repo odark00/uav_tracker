@@ -53,6 +53,7 @@ from ultralytics import YOLO
 
 from infer import MODELS, collect_sources, resolve_model
 
+
 ROOT = Path(__file__).resolve().parent
 LIGHTFC_DIR = ROOT / "third_party/LightFC"
 LIGHTFC_CFG = "mobilnetv2_p_pwcorr_se_scf_sc_iab_sc_adj_concat_repn33_se_conv33_center_wiou"

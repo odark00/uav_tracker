@@ -153,6 +153,7 @@ def main():
     model_path = resolve_model(args.ai, args.model)
     print(f"[model] {model_path}")
     model = YOLO(model_path)
+
     print(f"model classes: {model.names} | device: {device}")
 
     sources = collect_sources(args.source)

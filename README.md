@@ -18,3 +18,4 @@ python eval_detect.py --ai 1 --conf 0.45 --modality both --max-seqs 1
 --device — cuda:0/cpu. Дефолт: авто (cuda якщо є, інакше cpu).
 --out — куди дописати csv. Дефолт: runs/eval_detect.csv.
 --val — папка з валідацією. Дефолт: val.
+
