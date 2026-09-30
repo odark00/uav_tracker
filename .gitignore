@@ -1,0 +1,6 @@
+runs/
+val/
+__pycache__/
+*.pyc
+*.pt
+test_videos/

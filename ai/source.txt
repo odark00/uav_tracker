@@ -1,0 +1,7 @@
+1) YOLOv8n		https://huggingface.co/TomSmail/drone-yolo-v1
+2) YOLO12m		https://huggingface.co/shng2025/EDTH-Warsaw-shahed136-detector
+3) YOLOv8		https://github.com/DeepPythonist/drone-detector
+4) YOLO11n		https://github.com/droneforge/yolov11n-UAV-finetune
+5) YOLOv8n		https://github.com/Alireza0K/Unmanned-Aerial-Vehicle
+6) YOLO11L		https://github.com/forever218/YOLO-Drone-Detection
+7) YOLOv5 		https://github.com/ZhaoJ9014/Anti-UAV
