@@ -285,6 +285,8 @@ class ORTrackModel:
     also returns the peak score. Unlike LightFC the template goes through the ViT together with every search crop,
     so the template patch (not a feature) is cached."""
 
+    reid = True  # search box in self.state: can be re-run around a re-id candidate (SingleObject)
+
     def __init__(self, device, cfg_name="deit_tiny_distilled_patch16_224"):
         with repo_lib(ORTRACK_DIR):
             from lib.config.ortrack.config import cfg, update_config_from_file
@@ -329,6 +331,8 @@ class AsymTrackModel:
     """Port of third_party/AsymTrack/lib/test/tracker/AsymTrack.py (AAAI 2025, asymmetric Siamese EfficientMod).
     Its STARK corner head has no confidence output, so the score is the geometric mean of the two corner heatmaps'
     softmax peaks: a sharp single corner -> high, a flat or split heatmap (target gone / occluded) -> low."""
+
+    reid = True  # search box in self.state: can be re-run around a re-id candidate (SingleObject)
 
     def __init__(self, device, cfg_name="base"):
         with repo_lib(ASYMTRACK_DIR):
@@ -389,6 +393,8 @@ class SUTrackModel:
     computed once. T224 uses one template; B224 and the bigger configs keep TEST.NUM_TEMPLATES templates and replace
     the newest one every UPDATE_INTERVALS frames when the windowed peak exceeds UPDATE_THRESHOLD, as sutrack.py does.
     Score = peak of the centre heatmap."""
+
+    reid = True  # search box in self.state: can be re-run around a re-id candidate (SingleObject)
 
     def __init__(self, device, cfg_name="sutrack_t224"):
         import clip
@@ -471,6 +477,8 @@ class FocusTrackModel:
     MAX_SEARCH_FACTOR and the Hann window is switched off; it snaps back once the target is found. No grid warping
     (TEST.SEARCH.USE_GRID is off in the released configs). Score = peak of the centre heatmap."""
 
+    reid = True  # search box in self.state: can be re-run around a re-id candidate (SingleObject)
+
     def __init__(self, device, cfg_name="focustrack_stage2"):
         import types
 
@@ -540,6 +548,8 @@ class MCITrackModel:
     every frame with a windowed peak > UPT is pushed to a memory bank of MB templates, every INTER frames the
     NUM_TEMPLATES - 1 online templates are re-sampled evenly from it, and the hidden state is reset whenever the peak
     drops below UPH. Score = peak of the centre heatmap."""
+
+    reid = True  # search box in self.state: can be re-run around a re-id candidate (SingleObject)
 
     def __init__(self, device, cfg_name="mcitrack_b224", preset="UAV"):
         with repo_lib(MCITRACK_DIR):
@@ -885,10 +895,26 @@ class SingleObject:
                    tracker is re-initialised on it with the SAME id
     lost           after `patience` bad frames in a row, or when a strong detection elsewhere keeps contradicting
                    the tracker for `patience` frames (slow drift onto background) -> re-seed on the best detection,
-                   new id. Detections far from the prediction never break a healthy track (false positives)."""
+                   new id. Detections far from the prediction never break a healthy track (false positives).
+    Boxes scoring below `min_score` (coasting ones score 0) are not reported; the track itself goes on underneath,
+    so the id is kept when the score recovers.
 
-    def __init__(self, name, model, conf, lost_thr, patience, names, gate=3.0, strong=0.6):
-        self.name, self.model = name, model
+    Re-identification (reid_thr > 0, deep trackers with `reid = True`): a detection only re-acquires the target if
+    the tracker itself, with its current template, finds the target around it with a score >= reid_thr (template
+    matching with the tracker's own network) at a similar size, on `reid_confirm` frames in a row at a steady
+    position (one missed frame allowed). A small UAV and a bird score alike on one frame, but the birds of a flock
+    are detected at different places from frame to frame. Then the track goes on from there with the SAME id and
+    the template is kept (no re-init on the detection). Once a target exists, a lost one is searched for this way
+    over all detections in the frame (UAV behind a building, coming out elsewhere); a UAV seen as steadily that does
+    not match it is a different one and gets a new id."""
+
+    def __init__(self, name, model, conf, lost_thr, patience, names, gate=3.0, strong=0.6, min_score=0.0,
+                 reid_thr=0.0, reid_max=5, reid_confirm=5):
+        self.name, self.model, self.min_score = name, model, min_score
+        self.reid_max, self.reid_confirm = reid_max, reid_confirm
+        self.reid_thr = reid_thr if getattr(model, "reid", False) else 0.0  # others keep the plain re-seeding
+        self.reid_log = []  # (candidate det, score) of the last verification, for debugging
+        self.chain = None  # re-id candidate being confirmed: [box, score, frames seen, frames missed]
         self.conf, self.lost_thr, self.patience = conf, lost_thr, patience
         self.names, self.gate, self.strong = names, gate, strong
         self.tid, self.active, self.label = 0, False, ""
@@ -898,13 +924,81 @@ class SingleObject:
         self.model.init(frame, (x1, y1, x2 - x1, y2 - y1))
         self.kf = KalmanBox(det)
         self.bad = self.contradicted = 0
+        self.size = center_size(det)[2]
         if new_id:
             self.tid += 1
             self.label = self.names[int(k)]
         self.active = True
         return [(self.tid, (x1, y1, x2, y2), float(c), self.label)]
 
+    def _verify(self, frame, cands):
+        """Run the tracker on a search region centred on each candidate (most confident first), leaving its state
+        untouched. -> [(det, box xyxy, score, match)]: match = the tracker finds the target on this candidate with
+        score >= reid_thr and at 0.5-2x the target's last size (the network rescales every crop to the template, so
+        it does not see size: a far dot and a close UAV can both score high)."""
+        m, out, self.reid_log = self.model, [], []
+        snap = lambda d: {k: (list(v) if isinstance(v, list) else v) for k, v in d.items()}
+        saved = snap(vars(m))
+        for d in cands[np.argsort(-cands[:, 4])][:self.reid_max]:
+            m.state = xywh(d[:4])
+            ok, (x, y, w, h), score = m.update(frame)
+            vars(m).clear()
+            vars(m).update(snap(saved))
+            box = np.array([x, y, x + w, y + h])
+            dcx, dcy, dsz = center_size(d)
+            cx, cy, sz = center_size(box)
+            on_it = ok and np.hypot(cx - dcx, cy - dcy) < max(dsz, 16)  # found it on this candidate, not next to it
+            score = float(score) if on_it else 0.0
+            match = score >= self.reid_thr and 0.5 < sz / self.size < 2.0
+            self.reid_log.append((d, score))
+            out.append((d, box if on_it else d[:4], score, match))
+        return out
+
+    def _reacquire(self, frame, cands, new_ok):
+        """Re-id step: verify the candidates and follow the most promising one (a match first) over the frames, as
+        long as it moves less than 3/4 of its size per frame (one missed frame allowed). After reid_confirm frames
+        -> _resume if it matched the target on all but one of them; with `new_ok`, a different UAV (seen steadily,
+        mean detector confidence >= conf, but not the target) -> _start with a new id. Else None."""
+        res = self._verify(frame, cands) if len(cands) else []
+        best = max(res, key=lambda r: (r[3], r[2]), default=None)
+        c = self.chain
+        if c is not None:
+            ccx, ccy, csz = center_size(c["box"])
+            step = [r for r in res if np.hypot(*np.subtract(center_size(r[1])[:2], (ccx, ccy))) < 0.75 * max(csz, 8)]
+            if step and not (best[3] and not max(step, key=lambda r: (r[3], r[2]))[3]):
+                det, box, score, match = max(step, key=lambda r: (r[3], r[2]))
+                c.update(det=det, box=box, score=score, n=c["n"] + 1, miss=0, match=c["match"] + match,
+                         conf=c["conf"] + det[4])
+            elif not step and c["miss"] < 1:
+                c["miss"] += 1
+            else:
+                c = None  # lost it, or a match showed up elsewhere
+        if c is None and best is not None:
+            det, box, score, match = best
+            c = dict(det=det, box=box, score=score, n=1, miss=0, match=int(match), conf=det[4])
+        self.chain = c
+        if c is None or c["n"] < self.reid_confirm:
+            return None
+        if c["match"] >= c["n"] - 1:
+            return self._resume(c["box"], c["score"])
+        if new_ok and c["conf"] / c["n"] >= self.conf:
+            self.chain = None
+            return self._start(frame, c["det"], new_id=True)
+        return None
+
+    def _resume(self, box, score):
+        """Continue the same track at `box`, keeping the tracker's template."""
+        self.model.state = xywh(box)
+        self.kf = KalmanBox(box)
+        self.bad = self.contradicted = 0
+        self.size = center_size(box)[2]
+        self.active, self.chain = True, None
+        return [(self.tid, tuple(box), score, self.label)]
+
     def update(self, frame, dets):
+        return [t for t in self._track(frame, dets) if t[2] >= self.min_score]
+
+    def _track(self, frame, dets):
         good = dets[dets[:, 4] >= self.conf]
         if self.active:
             pred = self.kf.predict()
@@ -917,7 +1011,11 @@ class SingleObject:
             pcx, pcy, psz = center_size(pred)
             gate = self.gate * max(psz, 16)
             cx, cy, sz = center_size(box)
-            jumped = np.hypot(cx - pcx, cy - pcy) > gate or not 0.5 < sz / psz < 2.0
+            jumped = np.hypot(cx - pcx, cy - pcy) > gate
+            # a sudden size change is a jump to something else, unless (with re-id, which checks the size of what it
+            # picks up) the tracker is confident: a fixed-wing banking shows its full wingspan from one frame to the next
+            if not 0.5 < sz / psz < 2.0 and not (self.reid_thr and score >= self.strong):
+                jumped = True
 
             near = None  # detection closest to the prediction, within the gate
             if len(dets):
@@ -929,21 +1027,28 @@ class SingleObject:
 
             strong = good[good[:, 4] >= self.strong]
             self.contradicted = self.contradicted + 1 if len(strong) and max_iou(box, strong[:, :4]) < 0.1 else 0
+            if self.reid_thr and score >= self.strong:
+                self.contradicted = 0  # a confident tracker is not overruled by another UAV elsewhere; re-id can fix
 
             if self.contradicted > self.patience:  # drifted: a strong detection elsewhere, long enough
                 self.active = False
             elif ok and score >= self.lost_thr and not jumped and not missed:
                 self.kf.update(box)
-                self.bad = 0
+                self.bad, self.size = 0, sz
                 return [(self.tid, tuple(box), score, self.label)]
-            elif near is not None:  # re-acquire the same target from the detector
+            elif near is not None and not self.reid_thr:  # re-acquire the same target from the detector
                 return self._start(frame, near, new_id=False)
+            elif near is not None and (out := self._reacquire(frame, near[None], new_ok=False)):
+                return out
             else:
                 self.bad += 1
                 if self.bad <= self.patience:
                     return [(self.tid, tuple(pred), 0.0, self.label + " (coast)")]
                 self.active = False
 
+        if self.reid_thr and self.tid:  # lost: only the same target, wherever it shows up again
+            self.bad += 1
+            return self._reacquire(frame, dets, new_ok=True) or []
         if len(good):
             return self._start(frame, good[good[:, 4].argmax()], new_id=True)
         return []
@@ -963,7 +1068,9 @@ def build_trackers(args, fps, names, device):
             out.append(SORT(names, args.conf, args.patience))
         else:
             name, _, build, thr = SOT[t]
-            out.append(SingleObject(name, build(device), args.conf, thr, args.patience, names))
+            out.append(SingleObject(name, build(device), args.conf, thr, args.patience, names,
+                                    min_score=getattr(args, "min_score", 0.0),
+                                    reid_thr=getattr(args, "reid", 0.0)))
     return out
 
 
@@ -1163,7 +1270,7 @@ def main():
     ap.add_argument("--trackers", nargs="+", default=ALL_TRACKERS, choices=ALL_TRACKERS + list(GROUPS),
                     help="tracker names and/or groups: mot, classic, filter, deep")
     ap.add_argument("--conf", type=float, default=0.25, help="detection conf to start tracks / feed DeepSORT")
-    ap.add_argument("--det-low", type=float, default=0.1, help="lowest detection conf kept (ByteTrack 2nd stage)")
+    ap.add_argument("--det-low", type=float, default=0.3, help="lowest detection conf kept (ByteTrack 2nd stage)")
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--max-side", type=int, default=1280,
@@ -1171,8 +1278,13 @@ def main():
     ap.add_argument("--no-agnostic", dest="agnostic", action="store_false",
                     help="per-class NMS (default is class-agnostic: the model often puts a quadcopter AND a "
                          "fixed-wing box on the same UAV, which splits tracks)")
-    ap.add_argument("--patience", type=int, default=30,
+    ap.add_argument("--patience", type=int, default=10,
                     help="frames a lost track keeps being drawn at its Kalman prediction (all trackers)")
+    ap.add_argument("--min-score", type=float, default=0.25,
+                    help="hide single-object tracker boxes scoring below this (incl. coasting ones); 0 = show all")
+    ap.add_argument("--reid", type=float, default=0.5,
+                    help="deep single-object trackers: a lost target is only picked up again (same id) where the "
+                         "tracker's own template match scores at least this; 0 = off (re-seed on any detection)")
     ap.add_argument("--max-box", type=float, default=0.1,
                     help="ignore detections larger than this fraction of the frame area; 0 = off")
     ap.add_argument("--device", default=None, help="cuda:0 / cpu (auto if omitted)")

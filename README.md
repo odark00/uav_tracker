@@ -21,6 +21,10 @@ Compare several trackers side by side in one window:
 python track.py --trackers sutrack_b focustrack bytetrack --source /path/to/video.mp4
 ```
 
+Single-object trackers only draw a box when its score is at least 0.6. The tracker keeps running underneath, so the drone keeps its ID when the score recovers. Change this with `--min-score`, or use `--min-score 0` to show every box.
+
+The deep trackers (`sutrack`, `sutrack_b`, `mcitrack_b`, `focustrack`, `asymtrack`, `ortrack_deit`) keep following the same object after it is hidden, for example behind a building. While the target is lost, the tracker uses its own template of the drone to check each detection. A detection must score at least 0.5, at a size similar to the target's (0.5–2×), on 5 frames in a row at a steady position, before the track continues with the same ID. A drone that is seen steadily but does not match is a different drone and gets a new ID. Birds and false detections are ignored. Change the threshold with `--reid`, or use `--reid 0` for the old behaviour, which restarts on the most confident detection with a new ID.
+
 Save the result instead of (or as well as) showing it. Outputs are written under `runs/track/<video>_track.mp4`:
 
 ```bash
