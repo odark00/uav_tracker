@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+# model weights (download links in README.md)
+*.pt
+*.pth
+*.pth.tar
+third_party/SUTrack/checkpoints/
+third_party/MCITrack/checkpoints/
+third_party/FocusTrack/output/
+third_party/AsymTrack/checkpoints/
+third_party/ORTrack/output/
+# outputs of track.py / render_overlays.py
+runs/track/
+runs/overlays/

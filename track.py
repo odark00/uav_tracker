@@ -4,6 +4,7 @@ Compare UAV trackers on the same YOLOv8 detections, drawn side by side in real t
 
 Multi-object ("mot", fed by the detector every frame):
            bytetrack  - IoU + Kalman, two-stage matching incl. low-score boxes (ultralytics BYTETracker)
+           botsort    - ByteTrack + camera motion compensation, sparse optical flow (ultralytics BOTSORT)
            deepsort   - Kalman + MobileNet appearance embeddings (deep-sort-realtime)
            sort       - Kalman + Hungarian IoU matching, no appearance (own numpy implementation)
 Single-object, classic ("classic"):
@@ -19,31 +20,31 @@ Single-object, Bayesian filters on the detections ("filter"):
            kalman     - constant-velocity Kalman filter, gated nearest detection
            particle   - particle filter, colour histogram x detection likelihood
 Single-object, deep learning ("deep"):
-           lightfc    - MobileNetV2 Siamese + center head (third_party/LightFC, PyTorch on GPU)
-           nanotrack  - NanoTrack v2 (OpenCV TrackerNano)
-           vittrack   - lightweight ViT tracker (OpenCV TrackerVit)
-           lighttrack - NAS-found Siamese tracker   \
-           avtrack    - AVTrack-DeiT, adaptive ViT   |
-           siamfc     - SiamFC (AlexNet)             |  third_party/siam_zoo float ONNX, CPU (onnxruntime)
-           siamrpn    - SiamRPN (AlexNet)            |
-           siamrpnpp  - SiamRPN++ (MobileNetV2)      |
-           dasiamrpn  - DaSiamRPN                    |
-           mixformer  - MixFormerV2-S               /
+           ortrack_deit - ORTrack-DeiT, occlusion-robust ViT for UAVs, CVPR 2025 (third_party/ORTrack, GPU)
+           asymtrack  - AsymTrack-B, asymmetric Siamese EfficientMod, AAAI 2025 (third_party/AsymTrack, PyTorch on GPU)
+           sutrack    - SUTrack-T224, unified single-ViT tracker (Fast-iTPN tiny), AAAI 2025 (third_party/SUTrack, GPU)
+           sutrack_b  - SUTrack-B224, same with the Fast-iTPN base encoder and 2 templates (online update)
+           focustrack - FocusTrack, OSTrack ViT-B with adaptive search region for anti-UAV (third_party/FocusTrack, GPU)
+           mcitrack_b - MCITrack-B224, Fast-iTPN base + Mamba context neck, AAAI 2025 (third_party/MCITrack, GPU)
+           avtrack    - AVTrack-DeiT, adaptive ViT (third_party/siam_zoo float ONNX, CPU, onnxruntime)
 The detector runs once per frame and every tracker gets the same detections (boxes larger than --max-box of the
 frame are dropped). Single-object trackers start on the most confident detection; a Kalman motion model on top
 carries them through occlusions (cables, branches) and re-acquires the same target from nearby detections,
 see SingleObject.
 
 Run:       python track.py                                        # all trackers, all videos in ./test_videos
-           python track.py --trackers bytetrack lightfc --source test_videos/clip.mp4
+           python track.py --trackers bytetrack sutrack_b --source test_videos/clip.mp4
            python track.py --trackers deep                         # one group: mot / classic / filter / deep
            python track.py --save --no-show                       # write grid videos to ./runs/track
 
 Keys:      q / Esc = quit, n = next video, space = pause/resume
 """
 import argparse
+import json
+import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import cv2
@@ -54,9 +55,11 @@ from ultralytics import YOLO
 from infer import collect_sources
 
 ROOT = Path(__file__).resolve().parent
-LIGHTFC_DIR = ROOT / "third_party/LightFC"
-LIGHTFC_CFG = "mobilnetv2_p_pwcorr_se_scf_sc_iab_sc_adj_concat_repn33_se_conv33_center_wiou"
-NANOTRACK_DIR = ROOT / "third_party/nanotrack"
+ORTRACK_DIR = ROOT / "third_party/ORTrack"
+ASYMTRACK_DIR = ROOT / "third_party/AsymTrack"
+SUTRACK_DIR = ROOT / "third_party/SUTrack"
+FOCUSTRACK_DIR = ROOT / "third_party/FocusTrack"
+MCITRACK_DIR = ROOT / "third_party/MCITrack"
 SIAM_ZOO_DIR = ROOT / "third_party/siam_zoo"
 
 
@@ -89,6 +92,21 @@ class ByteTrack:
         tracks += [(t.track_id, t.xyxy, 0.0, self.names[int(t.cls)] + " (coast)") for t in self.tracker.lost_stracks
                    if fid - t.end_frame <= self.coast]
         return tracks
+
+
+class BoTSORT(ByteTrack):
+    """ByteTrack + global motion compensation (sparse optical flow warps the Kalman states when the camera pans).
+    ReID stays off (botsort.yaml default): its "auto" model needs the detector's features, which aren't passed."""
+    name = "BoT-SORT"
+
+    def __init__(self, fps, names, coast):
+        from ultralytics.trackers.bot_sort import BOTSORT
+        from ultralytics.utils import IterableSimpleNamespace, YAML
+        from ultralytics.utils.checks import check_yaml
+
+        cfg = IterableSimpleNamespace(**YAML.load(check_yaml("botsort.yaml")))
+        self.tracker = BOTSORT(cfg)
+        self.names, self.coast = names, coast
 
 
 class DeepSORT:
@@ -216,26 +234,333 @@ def sample_target(img, box, factor, out_sz):
     return cv2.resize(crop, (out_sz, out_sz)), out_sz / sz
 
 
-class LightFCModel:
-    """Port of third_party/LightFC/lib/test/tracker/lightfc.py that also returns the peak score."""
+@contextmanager
+def repo_lib(repo, pkg="lib"):
+    """LightFC, ORTrack, AsymTrack and pyCFTrackers are all a top-level package called `lib` (TCTrack: `pysot`):
+    import from `repo` with its own `pkg`, then put back whatever `pkg` was loaded before, so all of them can run in
+    the same process. Objects built inside keep working afterwards, they hold references to their own modules."""
+    own = lambda k: k == pkg or k.startswith(pkg + ".")
+    saved = {k: sys.modules.pop(k) for k in list(sys.modules) if own(k)}
+    sys.path.insert(0, str(repo))
+    try:
+        yield
+    finally:
+        sys.path.remove(str(repo))
+        for k in [k for k in sys.modules if own(k)]:
+            del sys.modules[k]
+        sys.modules.update(saved)
 
-    def __init__(self, device):
-        sys.path.insert(0, str(LIGHTFC_DIR))
-        from lib.models import LightFC
-        from lib.utils.load import load_yaml
 
-        cfg = load_yaml(str(LIGHTFC_DIR / f"experiments/lightfc/{LIGHTFC_CFG}.yaml"))
-        net = LightFC(cfg=cfg, env_num=None, training=False)
-        ckpt = torch.load(LIGHTFC_DIR / "checkpoints/lightfc_ep0400.pth.tar", map_location="cpu", weights_only=False)
+def load_module(name, path):
+    """Import a single file under a unique module name (for third-party files called config.py, tracker.py, ...)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def box_from_center_head(head, out, window, search_size, rf, state, W, H, margin):
+    """STARK/OSTrack center head -> (x, y, w, h) in the frame, as in LightFC/ORTrack track(); plus peak score."""
+    score = float(out["score_map"].max())
+    box = head.cal_bbox(window * out["score_map"], out["size_map"], out["offset_map"]).view(-1, 4).mean(0)
+    return crop_box_to_frame(box, search_size, rf, state, W, H, margin), score
+
+
+def crop_box_to_frame(box, search_size, rf, state, W, H, margin):
+    """(cx, cy, w, h) normalised to the search crop -> clipped (x, y, w, h) in the frame (map_box_back + clip_box)."""
+    cx, cy, w, h = (box * search_size / rf).tolist()
+    half = 0.5 * search_size / rf
+    cx += state[0] + 0.5 * state[2] - half
+    cy += state[1] + 0.5 * state[3] - half
+    x1, y1, x2, y2 = cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h
+    x1, y1 = min(max(0, x1), W - margin), min(max(0, y1), H - margin)  # clip_box
+    x2, y2 = min(max(margin, x2), W), min(max(margin, y2), H)
+    return [x1, y1, max(margin, x2 - x1), max(margin, y2 - y1)]
+
+
+class ORTrackModel:
+    """Port of third_party/ORTrack/lib/test/tracker/ortrack.py (CVPR 2025, occlusion-robust ViT for UAVs) that
+    also returns the peak score. Unlike LightFC the template goes through the ViT together with every search crop,
+    so the template patch (not a feature) is cached."""
+
+    def __init__(self, device, cfg_name="deit_tiny_distilled_patch16_224"):
+        with repo_lib(ORTRACK_DIR):
+            from lib.config.ortrack.config import cfg, update_config_from_file
+            from lib.models.ortrack import build_ortrack
+
+            update_config_from_file(str(ORTRACK_DIR / f"experiments/ortrack/{cfg_name}.yaml"))
+            net = build_ortrack(cfg, training=False)
+            ckpt = torch.load(ORTRACK_DIR / f"output/checkpoints/train/ortrack/Model/{cfg_name}/ORTrack_ep0300.pth.tar",
+                              map_location="cpu", weights_only=False)  # pickles lib.train.admin.local settings
         net.load_state_dict(ckpt["net"], strict=True)
-        for m in list(net.backbone.modules()) + list(net.head.modules()):
-            if hasattr(m, "switch_to_deploy"):
-                m.switch_to_deploy()
+        self.net = net.to(device).eval()
+        self.device = device
+        self.t, self.distill = cfg.TEST, cfg.MODEL.IS_DISTILL
+        fs = self.t.SEARCH_SIZE // cfg.MODEL.BACKBONE.STRIDE
+        hann = torch.hann_window(fs + 2, periodic=False)[1:-1]  # == hann2d(centered=True)
+        self.window = (hann[:, None] * hann[None, :]).to(device)[None, None]
+        self.mean = torch.tensor(cfg.DATA.MEAN, device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor(cfg.DATA.STD, device=device).view(1, 3, 1, 1)
+
+    def _tensor(self, patch):
+        t = torch.from_numpy(patch).to(self.device).float().permute(2, 0, 1)[None] / 255.0
+        return (t - self.mean) / self.std
+
+    def init(self, frame, box):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        z, _ = sample_target(rgb, box, self.t.TEMPLATE_FACTOR, self.t.TEMPLATE_SIZE)
+        self.z = self._tensor(z)
+        self.state = list(box)
+
+    @torch.no_grad()
+    def update(self, frame):
+        H, W = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        x, rf = sample_target(rgb, self.state, self.t.SEARCH_FACTOR, self.t.SEARCH_SIZE)
+        out = self.net(template=self.z, search=self._tensor(x), is_distill=self.distill)
+        self.state, score = box_from_center_head(self.net.box_head, out, self.window, self.t.SEARCH_SIZE, rf,
+                                                 self.state, W, H, margin=10)  # clip_box margin, as in ORTrack
+        return True, self.state, score
+
+
+class AsymTrackModel:
+    """Port of third_party/AsymTrack/lib/test/tracker/AsymTrack.py (AAAI 2025, asymmetric Siamese EfficientMod).
+    Its STARK corner head has no confidence output, so the score is the geometric mean of the two corner heatmaps'
+    softmax peaks: a sharp single corner -> high, a flat or split heatmap (target gone / occluded) -> low."""
+
+    def __init__(self, device, cfg_name="base"):
+        with repo_lib(ASYMTRACK_DIR):
+            from lib.config.AsymTrack.config import cfg, update_config_from_file
+            from lib.models.AsymTrack import build_asymtrack
+            from lib.utils.box_ops import box_xyxy_to_cxcywh
+
+            update_config_from_file(str(ASYMTRACK_DIR / f"experiments/AsymTrack/{cfg_name}.yaml"))
+            cfg.TEST_MODE = True  # skip the ImageNet backbone download, the checkpoint has everything
+            net = build_asymtrack(cfg)  # GPU only: the corner head calls .cuda() in __init__
+        ckpt = torch.load(ASYMTRACK_DIR / f"checkpoints/models/AsymTrack/{cfg_name}/AsymTrack_ep0500.pth.tar",
+                          map_location="cpu", weights_only=False)
+        net.load_state_dict(ckpt["net"], strict=True)
+        net.backbone.switch_to_deploy()
         self.net = net.to(device).eval()
         self.device = device
         self.t = cfg.TEST
-        fs = self.t.SEARCH_SIZE // cfg.MODEL.BACKBONE.STRIDE
-        hann = torch.hann_window(fs + 2, periodic=False)[1:-1]  # == LightFC hann1d(centered=True)
+        self.to_cxcywh = box_xyxy_to_cxcywh
+        self.mean = torch.tensor(cfg.DATA.MEAN, device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor(cfg.DATA.STD, device=device).view(1, 3, 1, 1)
+
+    def _tensor(self, patch):
+        t = torch.from_numpy(patch).to(self.device).float().permute(2, 0, 1)[None] / 255.0
+        return (t - self.mean) / self.std
+
+    def init(self, frame, box):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        z, _ = sample_target(rgb, box, self.t.TEMPLATE_FACTOR, self.t.TEMPLATE_SIZE)
+        self.z = self._tensor(z)
+        self.state = list(box)
+
+    @torch.no_grad()
+    def update(self, frame):
+        H, W = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        x, rf = sample_target(rgb, self.state, self.t.SEARCH_FACTOR, self.t.SEARCH_SIZE)
+        xyxy, p_tl, p_br = self._heads(self._tensor(x))
+        score = float(torch.sqrt(p_tl.max() * p_br.max()))
+        self.state = crop_box_to_frame(self.to_cxcywh(xyxy).view(-1, 4).mean(0), self.t.SEARCH_SIZE, rf,
+                                       self.state, W, H, margin=10)  # clip_box margin, as in AsymTrack / HiT
+        return True, self.state, score
+
+    def _heads(self, x):
+        """= forward_backbone + forward_head (LINEAR neck), but the corner head also returns its two heatmaps."""
+        feat = self.net.forward_backbone([x, self.z], train=False)[-1]
+        B, h, w, C = feat.shape
+        mem = self.net.bottleneck(feat.view(B, h * w, C))
+        fs = self.net.feat_sz_s
+        opt = mem.unsqueeze(-1).permute(0, 3, 2, 1).contiguous().view(-1, mem.shape[-1], fs, fs)
+        return self.net.box_head(opt, return_dist=True)
+
+
+class SUTrackModel:
+    """Port of third_party/SUTrack/lib/test/tracker/sutrack.py (AAAI 2025, unified single ViT, Fast-iTPN encoder)
+    for plain RGB: the RGB crop is duplicated into the 6-channel multi-modal input, as sutrack.py does, and the text
+    branch gets an empty prompt. The T224 checkpoint contains its CLIP ViT-L/14 text encoder, so CLIP is built from
+    those weights instead of clip.load() downloading it; with no prompt the text embedding is constant, so it is
+    computed once. T224 uses one template; B224 and the bigger configs keep TEST.NUM_TEMPLATES templates and replace
+    the newest one every UPDATE_INTERVALS frames when the windowed peak exceeds UPDATE_THRESHOLD, as sutrack.py does.
+    Score = peak of the centre heatmap."""
+
+    def __init__(self, device, cfg_name="sutrack_t224"):
+        import clip
+
+        ckpt = torch.load(SUTRACK_DIR / f"checkpoints/train/sutrack/{cfg_name}/SUTRACK_ep0180.pth.tar",
+                          map_location="cpu", weights_only=False)["net"]
+        prefix = "text_encoder.clip."
+        clip_sd = {k[len(prefix):]: v for k, v in ckpt.items() if k.startswith(prefix)}
+        load = clip.load  # = clip.load(jit=False) on the weights we already have
+        clip.load = lambda name, device="cpu": (clip.model.build_model(clip_sd).to(device), None)
+        try:
+            with repo_lib(SUTRACK_DIR):
+                from lib.config.sutrack.config import cfg, update_config_from_file
+                from lib.models.sutrack import build_sutrack, encoder as encoder_mod
+
+                update_config_from_file(str(SUTRACK_DIR / f"experiments/sutrack/{cfg_name}.yaml"))
+                encoder_mod.is_main_process = lambda: False  # = pretrained=False: no ImageNet Fast-iTPN weights
+                net = build_sutrack(cfg)
+        finally:
+            clip.load = load
+        net.load_state_dict(ckpt, strict=True)
+        self.net = net.to(device).eval()
+        self.device = device
+        self.t = cfg.TEST
+        fs = self.t.SEARCH_SIZE // cfg.MODEL.ENCODER.STRIDE
+        hann = torch.hann_window(fs + 2, periodic=False)[1:-1]  # == hann2d(centered=True)
+        self.window = (hann[:, None] * hann[None, :]).to(device)[None, None]
+        self.num_templates = self.t.NUM_TEMPLATES
+        self.update_interval = self.t.UPDATE_INTERVALS.DEFAULT
+        self.update_threshold = self.t.UPDATE_THRESHOLD.DEFAULT
+        self.mean = torch.tensor([0.485, 0.456, 0.406] * 2, device=device).view(1, 6, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225] * 2, device=device).view(1, 6, 1, 1)
+        with torch.no_grad():
+            self.text_src = self.net.forward_textencoder(text_data=torch.zeros(1, 77, dtype=torch.long, device=device))
+
+    def _tensor(self, patch):
+        t = torch.from_numpy(patch).to(self.device).float().permute(2, 0, 1)[None] / 255.0
+        return (t.repeat(1, 2, 1, 1) - self.mean) / self.std  # RGB -> 6 channels (RGB + the same RGB as "X")
+
+    def _template(self, rgb, box):
+        """-> (template tensor, its box normalised to the crop) = transform_image_to_crop(box, box, rf, ts, True)."""
+        z, rf = sample_target(rgb, box, self.t.TEMPLATE_FACTOR, self.t.TEMPLATE_SIZE)
+        ts = self.t.TEMPLATE_SIZE
+        cx, cy = (ts - 1) / 2, (ts - 1) / 2
+        w, h = box[2] * rf, box[3] * rf
+        anno = torch.tensor([[cx - w / 2, cy - h / 2, w, h]], device=self.device, dtype=torch.float32) / (ts - 1)
+        return self._tensor(z), anno
+
+    def init(self, frame, box):
+        z, anno = self._template(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), box)
+        self.z, self.z_anno = [z] * self.num_templates, [anno]  # as sutrack.py: one annotation until the first update
+        self.state = list(box)
+        self.frame_id = 0
+
+    @torch.no_grad()
+    def update(self, frame):
+        H, W = frame.shape[:2]
+        self.frame_id += 1
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        x, rf = sample_target(rgb, self.state, self.t.SEARCH_FACTOR, self.t.SEARCH_SIZE)
+        enc = self.net.forward_encoder(self.z, [self._tensor(x)], self.z_anno, self.text_src, None)
+        out = self.net.forward_decoder(feature=enc)
+        self.state, score = box_from_center_head(self.net.decoder, out, self.window, self.t.SEARCH_SIZE, rf,
+                                                 self.state, W, H, margin=10)  # clip_box margin, as in SUTrack
+        if (self.num_templates > 1 and self.frame_id % self.update_interval == 0
+                and float((self.window * out["score_map"]).max()) > self.update_threshold):
+            z, anno = self._template(rgb, self.state)  # keep the first template, replace the newest
+            self.z, self.z_anno = [*self.z, z], [*self.z_anno, anno]
+            if len(self.z) > self.num_templates:
+                self.z.pop(1)
+            if len(self.z_anno) > self.num_templates:
+                self.z_anno.pop(1)
+        return True, self.state, score
+
+
+class FocusTrackModel:
+    """Port of third_party/FocusTrack/lib/test/tracker/focustrack.py (anti-UAV, OSTrack ViT-B + mask decoder + a
+    "target in view" classification head). Search Region Adjustment: when the head says the target is out of the
+    crop (p < T_LOGITS) and the heatmap peak is below T_SCORE, the search factor grows by ENLARGE_STEP per frame up to
+    MAX_SEARCH_FACTOR and the Hann window is switched off; it snaps back once the target is found. No grid warping
+    (TEST.SEARCH.USE_GRID is off in the released configs). Score = peak of the centre heatmap."""
+
+    def __init__(self, device, cfg_name="focustrack_stage2"):
+        import types
+
+        if "mmseg" not in sys.modules:  # its SegViT decoder only subclasses mmseg's BaseDecodeHead for 2 attributes
+            class BaseDecodeHead(torch.nn.Module):
+                def __init__(self, in_channels, channels, num_classes, **kwargs):
+                    super().__init__()
+                    self.in_channels, self.channels, self.num_classes = in_channels, channels, num_classes
+                    self.conv_seg, self.loss_decode = torch.nn.Identity(), torch.nn.Identity()  # deleted by ATMHead
+
+            names = ["mmseg", "mmseg.models", "mmseg.models.decode_heads", "mmseg.models.decode_heads.decode_head"]
+            for n in names:
+                sys.modules.setdefault(n, types.ModuleType(n))
+            sys.modules[names[-1]].BaseDecodeHead = BaseDecodeHead
+        with repo_lib(FOCUSTRACK_DIR):
+            from lib.config.focustrack.config import cfg, update_config_from_file
+            from lib.models.focustrack import build_focustrack
+
+            update_config_from_file(str(FOCUSTRACK_DIR / f"experiments/focustrack/{cfg_name}.yaml"))
+            net = build_focustrack(cfg, training=False)
+            path = next((FOCUSTRACK_DIR / "output/checkpoints/train/focustrack").rglob(f"{cfg_name}/FocusTrack_ep*.pth.tar"))
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        net.load_state_dict(ckpt["net"], strict=True)
+        self.net = net.to(device).eval()
+        self.device = device
+        self.t = cfg.TEST
+        fs = self.t.SEARCH.SIZE // cfg.MODEL.BACKBONE.STRIDE
+        hann = torch.hann_window(fs + 2, periodic=False)[1:-1]  # == hann2d(centered=True)
+        self.window = (hann[:, None] * hann[None, :]).to(device)[None, None]
+        self.mean = torch.tensor(cfg.DATA.MEAN, device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor(cfg.DATA.STD, device=device).view(1, 3, 1, 1)
+
+    def _tensor(self, patch):
+        t = torch.from_numpy(patch).to(self.device).float().permute(2, 0, 1)[None] / 255.0
+        return (t - self.mean) / self.std
+
+    def init(self, frame, box):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        z, _ = sample_target(rgb, box, self.t.TEMPLATE.FACTOR, self.t.TEMPLATE.SIZE)
+        self.z = self._tensor(z)
+        self.state = list(box)
+        self.search_factor, self.use_hann = self.t.SEARCH.FACTOR, True
+
+    @torch.no_grad()
+    def update(self, frame):
+        H, W = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        size = self.t.SEARCH.SIZE
+        x, rf = sample_target(rgb, self.state, self.search_factor, size)
+        out = self.net(template=self.z, search=self._tensor(x), training=False)
+        window = self.window if self.use_hann else 1.0
+        self.state, score = box_from_center_head(self.net.box_head, out, window, size, rf,
+                                                 self.state, W, H, margin=10)  # clip_box margin, as in FocusTrack
+        if self.t.USE_REGION_ADJUST:
+            in_view = float(torch.softmax(out["logits"], dim=1)[0, -1])
+            if in_view < self.t.T_LOGITS and score < self.t.T_SCORE:
+                self.search_factor = min(self.search_factor + self.t.ENLARGE_STEP, self.t.MAX_SEARCH_FACTOR)
+                self.use_hann = False
+            else:
+                self.search_factor, self.use_hann = self.t.SEARCH.FACTOR, True
+        return True, self.state, score
+
+
+class MCITrackModel:
+    """Port of third_party/MCITrack/lib/test/tracker/mcitrack.py (AAAI 2025, Fast-iTPN encoder + Mamba "time neck"
+    whose hidden state carries context from frame to frame). Online settings are the repo's UAV123 ones (TEST.*.UAV):
+    every frame with a windowed peak > UPT is pushed to a memory bank of MB templates, every INTER frames the
+    NUM_TEMPLATES - 1 online templates are re-sampled evenly from it, and the hidden state is reset whenever the peak
+    drops below UPH. Score = peak of the centre heatmap."""
+
+    def __init__(self, device, cfg_name="mcitrack_b224", preset="UAV"):
+        with repo_lib(MCITRACK_DIR):
+            from lib.config.mcitrack.config import cfg, update_config_from_file
+            from lib.models.mcitrack import build_mcitrack, encoder as encoder_mod
+
+            update_config_from_file(str(MCITRACK_DIR / f"experiments/mcitrack/{cfg_name}.yaml"))
+            encoder_mod.is_main_process = lambda: False  # = pretrained=False: no ImageNet Fast-iTPN weights
+            net = build_mcitrack(cfg)
+        ckpt = torch.load(MCITRACK_DIR / f"checkpoints/train/mcitrack/{cfg_name}/MCITRACK_ep{cfg.TEST.EPOCH:04d}.pth.tar",
+                          map_location="cpu", weights_only=False)
+        net.load_state_dict(ckpt["net"], strict=True)
+        self.net = net.to(device).eval()
+        self.device = device
+        self.t = cfg.TEST
+        self.n_layers = cfg.MODEL.NECK.N_LAYERS
+        self.num_templates = self.t.NUM_TEMPLATES
+        self.upt, self.uph = self.t.UPT[preset], self.t.UPH[preset]
+        self.inter, self.mb = self.t.INTER[preset], self.t.MB[preset]
+        fs = self.t.SEARCH_SIZE // cfg.MODEL.ENCODER.STRIDE
+        hann = torch.hann_window(fs + 2, periodic=False)[1:-1]  # == hann2d(centered=True)
         self.window = (hann[:, None] * hann[None, :]).to(device)[None, None]
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
@@ -244,45 +569,49 @@ class LightFCModel:
         t = torch.from_numpy(patch).to(self.device).float().permute(2, 0, 1)[None] / 255.0
         return (t - self.mean) / self.std
 
-    @torch.no_grad()
+    def _template(self, rgb, box):
+        """-> (template tensor, its box normalised to the crop) = transform_image_to_crop(box, box, rf, ts, True)."""
+        z, rf = sample_target(rgb, box, self.t.TEMPLATE_FACTOR, self.t.TEMPLATE_SIZE)
+        ts = self.t.TEMPLATE_SIZE
+        cx, cy = (ts - 1) / 2, (ts - 1) / 2
+        w, h = box[2] * rf, box[3] * rf
+        anno = torch.tensor([[cx - w / 2, cy - h / 2, w, h]], device=self.device, dtype=torch.float32) / (ts - 1)
+        return self._tensor(z), anno
+
     def init(self, frame, box):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        z, _ = sample_target(rgb, box, self.t.TEMPLATE_FACTOR, self.t.TEMPLATE_SIZE)
-        self.z_feat = self.net.forward_backbone(self._tensor(z))
+        z, anno = self._template(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), box)
+        self.z, self.z_anno = [z] * self.num_templates, [anno] * self.num_templates
+        self.mem, self.mem_anno = list(self.z), list(self.z_anno)
+        self.h_state = [None] * self.n_layers
         self.state = list(box)
+        self.frame_id = 0
 
     @torch.no_grad()
     def update(self, frame):
         H, W = frame.shape[:2]
+        self.frame_id += 1
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         x, rf = sample_target(rgb, self.state, self.t.SEARCH_FACTOR, self.t.SEARCH_SIZE)
-        out = self.net.forward_tracking(z_feat=self.z_feat, x=self._tensor(x))
-        score = float(out["score_map"].max())
-        resp = self.window * out["score_map"]
-        cx, cy, w, h = (self.net.head.cal_bbox(resp, out["size_map"], out["offset_map"]).view(-1, 4).mean(0)
-                        * self.t.SEARCH_SIZE / rf).tolist()
-        half = 0.5 * self.t.SEARCH_SIZE / rf
-        cx += self.state[0] + 0.5 * self.state[2] - half
-        cy += self.state[1] + 0.5 * self.state[3] - half
-        x1, y1, x2, y2 = cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h
-        m = 2  # clip_box margin, as in LightFC
-        x1, y1 = min(max(0, x1), W - m), min(max(0, y1), H - m)
-        x2, y2 = min(max(m, x2), W), min(max(m, y2), H)
-        self.state = [x1, y1, max(m, x2 - x1), max(m, y2 - y1)]
+        enc = self.net.forward_encoder(self.z, [self._tensor(x)], self.z_anno)
+        _, feat, h = self.net.forward_neck(enc, list(self.h_state))
+        out = self.net.forward_decoder(feature=feat)
+        self.state, score = box_from_center_head(self.net.decoder, out, self.window, self.t.SEARCH_SIZE, rf,
+                                                 self.state, W, H, margin=10)  # clip_box margin, as in MCITrack
+        conf = float((self.window * out["score_map"]).max())
+        self.h_state = h if conf >= self.uph else [None] * self.n_layers
+        if self.num_templates > 1 and conf > self.upt:
+            z, anno = self._template(rgb, self.state)
+            self.mem.append(z)
+            self.mem_anno.append(anno)
+            if len(self.mem) > self.mb:
+                self.mem.pop(0)
+                self.mem_anno.pop(0)
+        if self.frame_id % self.inter == 0:  # keep the first template, re-sample the others from the memory bank
+            step = len(self.mem) // self.num_templates
+            for i in range(1, self.num_templates):
+                self.z = [*self.z[:1], *self.z[2:], self.mem[step * i]]
+                self.z_anno = [*self.z_anno[:1], *self.z_anno[2:], self.mem_anno[step * i]]
         return True, self.state, score
-
-
-def nano_params():
-    p = cv2.TrackerNano_Params()
-    p.backbone = str(NANOTRACK_DIR / "nanotrack_backbone_sim.onnx")
-    p.neckhead = str(NANOTRACK_DIR / "nanotrack_head_sim.onnx")
-    return p
-
-
-def vit_params():
-    p = cv2.TrackerVit_Params()
-    p.net = str(SIAM_ZOO_DIR / "models/vittrack_cv/vittrack.onnx")
-    return p
 
 
 class OpenCVModel:
@@ -519,18 +848,15 @@ SOT = {
     "ivt":       ("IVT",       "classic", lambda d: IVTModel(), 0.1),
     "kalman":    ("Kalman",    "filter",  lambda d: KalmanModel(), 0.01),
     "particle":  ("Particle",  "filter",  lambda d: ParticleFilterModel(), 0.05),
-    "lightfc":   ("LightFC",   "deep",    lambda d: LightFCModel(d), 0.3),
-    "nanotrack": ("NanoTrack", "deep",    lambda d: OpenCVModel(lambda: cv2.TrackerNano_create(nano_params())), 0.3),
-    "vittrack":  ("VitTrack",  "deep",    lambda d: OpenCVModel(lambda: cv2.TrackerVit_create(vit_params())), 0.3),
-    "lighttrack": ("LightTrack", "deep",  lambda d: SiamZooModel("lighttrack"), 0.3),
+    "ortrack_deit": ("ORTrack-DeiT", "deep", lambda d: ORTrackModel(d, "deit_tiny_patch16_224"), 0.3),
+    "asymtrack": ("AsymTrack-B", "deep",  lambda d: AsymTrackModel(d, "base"), 0.3),
+    "sutrack":   ("SUTrack-T", "deep",    lambda d: SUTrackModel(d), 0.3),
+    "sutrack_b": ("SUTrack-B", "deep",    lambda d: SUTrackModel(d, "sutrack_b224"), 0.3),
+    "focustrack": ("FocusTrack", "deep",  lambda d: FocusTrackModel(d), 0.3),
+    "mcitrack_b": ("MCITrack-B", "deep",  lambda d: MCITrackModel(d, "mcitrack_b224"), 0.3),
     "avtrack":   ("AVTrack",   "deep",    lambda d: SiamZooModel("avtrack_deit"), 0.3),
-    "siamfc":    ("SiamFC",    "deep",    lambda d: SiamZooModel("siamfc"), 2.0),  # raw xcorr response, ~4-7 on target
-    "siamrpn":   ("SiamRPN",   "deep",    lambda d: SiamZooModel("siamrpn_alex"), 0.3),
-    "siamrpnpp": ("SiamRPN++", "deep",    lambda d: SiamZooModel("siamrpnpp_mobilev2"), 0.3),
-    "dasiamrpn": ("DaSiamRPN", "deep",    lambda d: SiamZooModel("dasiamrpn"), 0.3),
-    "mixformer": ("MixFormerV2", "deep",  lambda d: SiamZooModel("mixformerv2_s"), 0.1),
 }
-MOT = ["bytetrack", "deepsort", "sort"]
+MOT = ["bytetrack", "botsort", "deepsort", "sort"]
 GROUPS = {"mot": MOT, **{g: [k for k, v in SOT.items() if v[1] == g] for g in ("classic", "filter", "deep")}}
 ALL_TRACKERS = [*MOT, *SOT]
 
@@ -629,6 +955,8 @@ def build_trackers(args, fps, names, device):
     for t in args.trackers:
         if t == "bytetrack":
             out.append(ByteTrack(fps, names, args.patience))
+        elif t == "botsort":
+            out.append(BoTSORT(fps, names, args.patience))
         elif t == "deepsort":
             out.append(DeepSORT(fps, names, args.conf, args.patience))
         elif t == "sort":
@@ -671,7 +999,8 @@ def panel_size(n, frame_w, frame_h, max_w, max_h):
     return int(frame_w * s), int(frame_h * s), cols
 
 
-def draw_panel(frame, name, tracks, fps, panel_w):
+def draw_panel(frame, tracks, hud, panel_w):
+    """Boxes with id / label / score, and the `hud` lines on a dark band at the top."""
     img = frame.copy()
     s = img.shape[1] / panel_w * 0.75  # the panel is shrunk to panel_w px, so draw text big enough to survive it
     fs, lw = 0.5 * s, max(1, round(1.5 * s))
@@ -684,12 +1013,38 @@ def draw_panel(frame, name, tracks, fps, panel_w):
         ty = max(y1, th + 6)
         cv2.rectangle(img, (x1, ty - th - 6), (x1 + tw + 4, ty), color, -1)
         cv2.putText(img, text, (x1 + 2, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), lw)
-    lines = [f"{name} | FPS {fps:.0f} | objects {len(tracks)}"]  # FPS = total, detector + tracker
-    for i, hud in enumerate(lines):
+    band = img[:int((12 + 22 * len(hud)) * s)]
+    band[:] = (band * 0.45).astype(np.uint8)
+    for i, line in enumerate(hud):
         org = (int(8 * s), int((24 + 22 * i) * s))
-        cv2.putText(img, hud, org, cv2.FONT_HERSHEY_SIMPLEX, fs * 1.1, (0, 0, 0), lw * 3)
-        cv2.putText(img, hud, org, cv2.FONT_HERSHEY_SIMPLEX, fs * 1.1, (255, 255, 255), lw)
+        cv2.putText(img, line, org, cv2.FONT_HERSHEY_SIMPLEX, fs * 1.1, (0, 0, 0), lw * 3)
+        cv2.putText(img, line, org, cv2.FONT_HERSHEY_SIMPLEX, fs * 1.1, (255, 255, 255), lw)
     return img
+
+
+def video_gt(src, scale):
+    """Ground truth of <video>.json (Anti-UAV: exist + gt_rect x, y, w, h) per frame as (x1, y1, x2, y2) in the
+    working frame (original pixels * scale), None on frames without the target; None if there is no json."""
+    path = src.with_suffix(".json") if isinstance(src, Path) else None
+    if path is None or not path.exists():
+        return None
+    gt = json.loads(path.read_text())
+    return [tuple(v * scale for v in (r[0], r[1], r[0] + r[2], r[1] + r[3])) if e and len(r) == 4 else None
+            for e, r in zip(gt["exist"], gt["gt_rect"])]
+
+
+class Precision:
+    """Running precision: share of all boxes shown so far that match the GT target at IoU >= 0.5."""
+
+    def __init__(self):
+        self.tp = self.n = 0
+
+    def add(self, boxes, g):
+        self.n += len(boxes)
+        self.tp += int(g is not None and len(boxes) > 0 and max_iou(np.array(g), np.array(boxes)) >= 0.5)
+
+    def __str__(self):
+        return f"precision {self.tp / self.n:.2f} ({self.tp}/{self.n})" if self.n else "precision -"
 
 
 def make_grid(panels, pw, ph, cols):
@@ -716,7 +1071,9 @@ def run_video(model, src, args, device):
         print(f"[resize] {src_w}x{src_h} -> {work_w}x{work_h} (--max-side {args.max_side})")
     print(f"[run] {name} | trackers: {', '.join(t.name for t in trackers)}")
 
-    stats = {t.name: {"ms": [], "frames": 0, "ids": set(), "ema": None} for t in trackers}
+    stats = {t.name: {"ms": [], "frames": 0, "ids": set(), "ema": None, "prec": Precision()} for t in trackers}
+    gt = video_gt(src, work_w / src_w)
+    det_prec, det_ema = Precision(), None
     det_ms_all, writer, out_path, grid = [], None, None, None
     keep_going, paused, n = True, False, 0
     while True:
@@ -735,6 +1092,11 @@ def run_video(model, src, args, device):
                 dets = dets[area <= args.max_box * frame.shape[0] * frame.shape[1]]
             det_ms = (time.perf_counter() - t0) * 1000
             det_ms_all.append(det_ms)
+            det_ema = ema(det_ema, det_ms)
+            g = gt[n - 1] if gt is not None and n <= len(gt) else None
+            shown = dets[dets[:, 4] >= args.conf]  # detections at the confidence that starts / feeds tracks
+            det_prec.add(shown[:, :4], g)
+            det_q = str(det_prec) if gt is not None else f"conf {shown[:, 4].max():.2f}" if len(shown) else "conf -"
 
             panels = []
             for t in trackers:
@@ -745,8 +1107,14 @@ def run_video(model, src, args, device):
                 s["ms"].append(ms)
                 s["frames"] += bool(tracks)
                 s["ids"].update(tid for tid, *_ in tracks)
-                s["ema"] = ema(s["ema"], det_ms + ms)  # smooth ms, then invert for FPS
-                panels.append(draw_panel(frame, t.name, tracks, 1000 / s["ema"], panel_w))
+                s["ema"] = ema(s["ema"], ms)  # smooth ms, then invert for FPS
+                s["prec"].add([b for _, b, *_ in tracks], g)
+                trk_q = str(s["prec"]) if gt is not None else \
+                    f"score {max(sc for *_, sc, _ in tracks):.2f}" if tracks else "score -"
+                hud = [f"{t.name} | total {1000 / (det_ema + s['ema']):.0f} FPS (detector + tracker)",
+                       f"Detector: every frame, {det_ema:.1f} ms = {1000 / det_ema:.0f} FPS | {det_q}",
+                       f"Tracker:  every frame, {s['ema']:.1f} ms = {1000 / s['ema']:.0f} FPS | {trk_q}"]
+                panels.append(draw_panel(frame, tracks, hud, panel_w))
             grid = make_grid(panels, panel_w, panel_h, cols)
 
             if args.save and writer is None:
@@ -776,12 +1144,14 @@ def run_video(model, src, args, device):
 
     warm = slice(5, None) if n > 10 else slice(None)  # skip warm-up frames in timing
     det = np.mean(det_ms_all[warm])
-    print(f"\n{name}: {n} frames | detector {det:.1f} ms/frame")
-    print(f"{'tracker':<11} {'ms/frame':>9} {'FPS':>7} {'frames w/ track':>16} {'unique IDs':>11}")
+    print(f"\n{name}: {n} frames | detector {det:.1f} ms/frame" + (f" | detector {det_prec}" if gt else ""))
+    print(f"{'tracker':<11} {'ms/frame':>9} {'FPS':>7} {'frames w/ track':>16} {'unique IDs':>11}"
+          + (f" {'precision':>10}" if gt else ""))
     for tname, s in stats.items():
         ms = np.mean(s["ms"][warm])
         print(f"{tname:<11} {ms:>9.2f} {1000 / (det + ms):>7.1f} "
-              f"{s['frames']:>9}/{n:<6} {len(s['ids']):>11}")
+              f"{s['frames']:>9}/{n:<6} {len(s['ids']):>11}"
+              + (f" {s['prec'].tp / max(s['prec'].n, 1):>10.3f}" if gt else ""))
     print()
     return keep_going
 
